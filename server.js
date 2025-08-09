@@ -1,238 +1,268 @@
+// server.js — Node core HTTP server + Supabase auth + single-session enforcement
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
-// In-memory storage for users and sessions. In a production system you would
-// persist these to a database. This is just for demonstration.
-const users = {};
-// Map session tokens to usernames
-const sessionTokens = {};
-// Map usernames to current active session token (for single-login enforcement)
-const userSessions = {};
+const PORT = process.env.PORT || 3000;
 
-/**
- * Helper to send an HTTP response with a given status code, headers and body.
- * @param {http.ServerResponse} res
- * @param {number} statusCode
- * @param {Object} headers
- * @param {string|Buffer} body
- */
-function sendResponse(res, statusCode, headers, body) {
-  res.writeHead(statusCode, headers);
-  res.end(body);
+// ====== ENV (set these in Render dashboard) ======
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // secret
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+// ================================================
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE. Set env vars in Render.');
+  process.exit(1);
 }
 
-/**
- * Parses the cookies from the request header into an object.
- * @param {http.IncomingMessage} req
- * @returns {Object}
- */
-function parseCookies(req) {
-  const list = {};
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) return list;
-  cookieHeader.split(';').forEach(cookie => {
-    const parts = cookie.split('=');
-    const key = parts[0] && parts[0].trim();
-    const value = parts[1] && parts[1].trim();
-    if (key && value) {
-      list[key] = decodeURIComponent(value);
-    }
-  });
-  return list;
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-/**
- * Generates a random session token.
- * @returns {string}
- */
-function generateToken() {
-  return crypto.randomBytes(16).toString('hex');
-}
+const publicDir = path.join(__dirname, 'public');
 
-/**
- * Serves static files from the public directory.
- * Automatically infers content type from the file extension.
- * @param {http.ServerResponse} res
- * @param {string} filePath
- */
-function serveStatic(res, filePath) {
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      sendResponse(res, 404, { 'Content-Type': 'text/plain' }, 'Not found');
-    } else {
-      const ext = path.extname(filePath).toLowerCase();
-      let contentType = 'text/plain';
-      if (ext === '.html') contentType = 'text/html';
-      else if (ext === '.css') contentType = 'text/css';
-      else if (ext === '.js') contentType = 'application/javascript';
-      else if (ext === '.png') contentType = 'image/png';
-      else if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';
-      else if (ext === '.mp4') contentType = 'video/mp4';
-      else if (ext === '.ico') contentType = 'image/x-icon';
-      sendResponse(res, 200, { 'Content-Type': contentType }, data);
-    }
+// small helpers
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (chunk) => (data += chunk));
+    req.on('end', () => {
+      const ct = req.headers['content-type'] || '';
+      if (ct.includes('application/json')) {
+        try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); }
+      } else if (ct.includes('application/x-www-form-urlencoded')) {
+        const obj = {};
+        for (const kv of (data || '').split('&')) {
+          if (!kv) continue;
+          const [k, v] = kv.split('=');
+          obj[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '));
+        }
+        resolve(obj);
+      } else {
+        resolve({ raw: data });
+      }
+    });
+    req.on('error', reject);
   });
 }
 
-/**
- * Checks if the request is associated with a valid logged in session. If so,
- * returns the username; otherwise returns null.
- * @param {http.IncomingMessage} req
- */
-function getLoggedInUser(req) {
-  const cookies = parseCookies(req);
-  const token = cookies.session;
-  if (!token) return null;
-  const username = sessionTokens[token];
-  if (!username) return null;
-  // Check that this token is still the active session for this user
-  if (userSessions[username] !== token) {
-    // Token is stale (another login happened)
+function setCookie(res, name, value, opts = {}) {
+  const parts = [`${name}=${value}`];
+  if (opts.httpOnly !== false) parts.push('HttpOnly');
+  if (opts.secure !== false) parts.push('Secure');
+  parts.push(`SameSite=Lax`);
+  parts.push(`Path=/`);
+  if (opts.maxAge) parts.push(`Max-Age=${opts.maxAge}`);
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearCookie(res, name) {
+  res.setHeader('Set-Cookie', `${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
+function getCookies(req) {
+  const str = req.headers.cookie || '';
+  const out = {};
+  str.split(';').forEach((c) => {
+    const [k, v] = c.split('=');
+    if (!k) return;
+    out[k.trim()] = decodeURIComponent((v || '').trim());
+  });
+  return out;
+}
+
+function sendFile(res, filepath, status = 200, replacements = {}) {
+  try {
+    let html = fs.readFileSync(filepath, 'utf8');
+    for (const [k, v] of Object.entries(replacements)) {
+      html = html.replaceAll(k, v);
+    }
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  } catch (e) {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+}
+
+async function verifySession(req) {
+  try {
+    const cookies = getCookies(req);
+    const token = cookies['ssid'];
+    if (!token) return null;
+    const payload = jwt.verify(token, JWT_SECRET);
+    const { user_id, device_id } = payload;
+
+    const { data, error } = await supabase
+      .from('sessions')
+      .select('id, revoked, device_id, user_id')
+      .eq('user_id', user_id)
+      .eq('device_id', device_id)
+      .eq('revoked', false)
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !data) return null;
+
+    // touch last_seen
+    await supabase
+      .from('sessions')
+      .update({ last_seen: new Date().toISOString() })
+      .eq('id', data.id);
+
+    return { user_id, device_id };
+  } catch {
     return null;
   }
-  return username;
 }
 
-/**
- * Handler for incoming HTTP requests. Routes requests to appropriate handlers.
- */
-function requestHandler(req, res) {
-  const method = req.method;
-  const url = req.url.split('?')[0];
+// Routes
+async function handle(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
 
-  // Serve static files from the public directory
-  const publicDir = path.join(__dirname, 'public');
-  // If the request is for a file inside /public, handle it
-  if (url.startsWith('/static/')) {
-    const filePath = path.join(publicDir, url.replace('/static/', ''));
-    return serveStatic(res, filePath);
+  // static CSS
+  if (pathname.startsWith('/static/')) {
+    const f = path.join(publicDir, pathname.replace('/static/', ''));
+    if (fs.existsSync(f)) {
+      const ext = path.extname(f).toLowerCase();
+      const mime = ext === '.css' ? 'text/css' : 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime });
+      return fs.createReadStream(f).pipe(res);
+    }
+    res.writeHead(404); return res.end('Not found');
   }
 
-  // Routing logic
-  if (method === 'GET' && url === '/') {
-    // Home page
-    return serveStatic(res, path.join(publicDir, 'home.html'));
+  // Home
+  if (pathname === '/' && req.method === 'GET') {
+    return sendFile(res, path.join(publicDir, 'home.html'));
   }
-  if (method === 'GET' && url === '/login') {
-    return serveStatic(res, path.join(publicDir, 'login.html'));
+
+  // Register page / POST
+  if (pathname === '/register' && req.method === 'GET') {
+    return sendFile(res, path.join(publicDir, 'register.html'));
   }
-  if (method === 'GET' && url === '/register') {
-    return serveStatic(res, path.join(publicDir, 'register.html'));
-  }
-  if (method === 'GET' && url === '/dashboard') {
-    const username = getLoggedInUser(req);
-    if (!username) {
-      // Redirect to login
-      sendResponse(res, 302, { 'Location': '/login' }, '');
-    } else {
-      // Serve dashboard page
-      fs.readFile(path.join(publicDir, 'dashboard.html'), 'utf8', (err, contents) => {
-        if (err) {
-          sendResponse(res, 500, { 'Content-Type': 'text/plain' }, 'Server error');
-        } else {
-          // Replace placeholder with username
-          const page = contents.replace(/{{USERNAME}}/g, username);
-          sendResponse(res, 200, { 'Content-Type': 'text/html' }, page);
-        }
-      });
+  if (pathname === '/register' && req.method === 'POST') {
+    const body = await readBody(req);
+    const email = (body.email || '').trim().toLowerCase();
+    const password = (body.password || '').trim();
+
+    if (!email || !password) {
+      res.writeHead(400); return res.end('Email and password required');
     }
-    return;
-  }
-  if (method === 'GET' && url.startsWith('/video/')) {
-    const username = getLoggedInUser(req);
-    if (!username) {
-      sendResponse(res, 302, { 'Location': '/login' }, '');
-    } else {
-      // Serve video page (we only have one sample page)
-      const id = url.split('/').pop();
-      fs.readFile(path.join(publicDir, 'video.html'), 'utf8', (err, contents) => {
-        if (err) {
-          sendResponse(res, 500, { 'Content-Type': 'text/plain' }, 'Server error');
-        } else {
-          const page = contents.replace(/{{USERNAME}}/g, username).replace(/{{VIDEO_ID}}/g, id);
-          sendResponse(res, 200, { 'Content-Type': 'text/html' }, page);
-        }
-      });
+
+    // check if exists
+    const exist = await supabase.from('users').select('id').eq('email', email).limit(1).maybeSingle();
+    if (exist.data) {
+      res.writeHead(409); return res.end('Email already registered');
     }
-    return;
+
+    const hash = bcrypt.hashSync(password, 10);
+    const ins = await supabase.from('users').insert({ email, password_hash: hash }).select('id').single();
+    if (ins.error) { res.writeHead(500); return res.end('Failed to register'); }
+
+    res.writeHead(302, { Location: '/login' });
+    return res.end();
   }
-  if (method === 'GET' && url === '/logout') {
-    const cookies = parseCookies(req);
-    const token = cookies.session;
-    if (token && sessionTokens[token]) {
-      const username = sessionTokens[token];
-      // Remove token from mappings
-      delete sessionTokens[token];
-      if (userSessions[username] === token) delete userSessions[username];
+
+  // Login page / POST
+  if (pathname === '/login' && req.method === 'GET') {
+    return sendFile(res, path.join(publicDir, 'login.html'));
+  }
+  if (pathname === '/login' && req.method === 'POST') {
+    const body = await readBody(req);
+    const email = (body.email || '').trim().toLowerCase();
+    const password = (body.password || '').trim();
+
+    const row = await supabase
+      .from('users')
+      .select('id, password_hash')
+      .eq('email', email)
+      .limit(1)
+      .maybeSingle();
+
+    if (!row.data || !bcrypt.compareSync(password, row.data.password_hash)) {
+      res.writeHead(401); return res.end('Invalid email or password');
     }
-    // Clear cookie
-    sendResponse(res, 302, { 'Location': '/', 'Set-Cookie': 'session=; Max-Age=0; Path=/' }, '');
-    return;
+
+    const user_id = row.data.id;
+    // revoke previous sessions
+    await supabase.from('sessions').update({ revoked: true }).eq('user_id', user_id).eq('revoked', false);
+
+    const device_id = crypto.randomUUID();
+    const ua = req.headers['user-agent'] || '';
+    const ip = (req.headers['x-forwarded-for'] || '').toString().split(',')[0] || req.socket.remoteAddress || '';
+
+    const s = await supabase
+      .from('sessions')
+      .insert({ user_id, device_id })
+      .select('id')
+      .single();
+
+    if (s.error) { res.writeHead(500); return res.end('Failed to create session'); }
+
+    // sign JWT
+    const token = jwt.sign({ user_id, device_id }, JWT_SECRET, { expiresIn: '2h' });
+    setCookie(res, 'ssid', token, { httpOnly: true, secure: true, maxAge: 7200 });
+
+    res.writeHead(302, { Location: '/dashboard' });
+    return res.end();
   }
-  if (method === 'POST' && url === '/register') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const username = params.get('username');
-      const password = params.get('password');
-      if (!username || !password) {
-        sendResponse(res, 400, { 'Content-Type': 'text/plain' }, 'Missing credentials');
-        return;
-      }
-      if (users[username]) {
-        sendResponse(res, 200, { 'Content-Type': 'text/html' }, `<p>User already exists. <a href="/login">Login here</a></p>`);
-        return;
-      }
-      // Simple password storage (plain text). For demonstration only!
-      users[username] = password;
-      sendResponse(res, 302, { 'Location': '/login' }, '');
-    });
-    return;
+
+  // Logout
+  if (pathname === '/logout' && req.method === 'GET') {
+    const session = await verifySession(req);
+    if (session) {
+      await supabase
+        .from('sessions')
+        .update({ revoked: true })
+        .eq('user_id', session.user_id)
+        .eq('device_id', session.device_id)
+        .eq('revoked', false);
+    }
+    clearCookie(res, 'ssid');
+    res.writeHead(302, { Location: '/' });
+    return res.end();
   }
-  if (method === 'POST' && url === '/login') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const username = params.get('username');
-      const password = params.get('password');
-      if (!username || !password) {
-        sendResponse(res, 400, { 'Content-Type': 'text/plain' }, 'Missing credentials');
-        return;
-      }
-      if (!users[username] || users[username] !== password) {
-        sendResponse(res, 200, { 'Content-Type': 'text/html' }, `<p>Invalid credentials. <a href="/login">Try again</a></p>`);
-        return;
-      }
-      // Create a new session token, revoke previous session
-      const token = generateToken();
-      // Revoke previous session if exists
-      const oldToken = userSessions[username];
-      if (oldToken) {
-        delete sessionTokens[oldToken];
-      }
-      // Store new session
-      userSessions[username] = token;
-      sessionTokens[token] = username;
-      // Set cookie
-      const expiresIn = 60 * 60 * 24; // 1 day
-      sendResponse(res, 302, {
-        'Location': '/dashboard',
-        'Set-Cookie': `session=${token}; Max-Age=${expiresIn}; HttpOnly; Path=/`
-      }, '');
-    });
-    return;
+
+  // Protected pages
+  if (pathname === '/dashboard' && req.method === 'GET') {
+    const session = await verifySession(req);
+    if (!session) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+
+    // fetch email to display
+    const user = await supabase.from('users').select('email').eq('id', session.user_id).single();
+    const username = user.data?.email?.split('@')[0] || 'Student';
+    return sendFile(res, path.join(publicDir, 'dashboard.html'), 200, { '{{USERNAME}}': username });
   }
-  // Default: 404
-  sendResponse(res, 404, { 'Content-Type': 'text/plain' }, 'Not found');
+
+  if (pathname === '/video' && req.method === 'GET') {
+    const session = await verifySession(req);
+    if (!session) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+
+    const user = await supabase.from('users').select('email').eq('id', session.user_id).single();
+    const username = user.data?.email?.split('@')[0] || 'Student';
+    return sendFile(res, path.join(publicDir, 'video.html'), 200, { '{{USERNAME}}': username });
+  }
+
+  // Fallback 404
+  res.writeHead(404);
+  res.end('Not found');
 }
 
-const server = http.createServer(requestHandler);
-
-const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
+http.createServer((req, res) => {
+  // basic security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  handle(req, res).catch((e) => {
+    console.error(e);
+    res.writeHead(500); res.end('Server error');
+  });
+}).listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
