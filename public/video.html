@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Lesson | Tutoring Platform</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Video Lesson</h1>
+  </header>
+  <main>
+    <p>Hello, {{USERNAME}}! Enjoy your lesson.</p>
+
+    <!-- Responsive YouTube embed with autoplay + mute -->
+    <div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:8px;background:#000">
+      <iframe
+        src="https://www.youtube-nocookie.com/embed/1ftTUvoc0ZM?autoplay=1&mute=1"
+        title="Intro video"
+        frameborder="0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        allowfullscreen
+        style="position:absolute;top:0;left:0;width:100%;height:100%">
+      </iframe>
+    </div>
+
+    <nav>
+      <a href="/dashboard">Back to Dashboard</a>
+      <a href="/logout">Logout</a>
+    </nav>
+  </main>
+  <footer></footer>
+</body>
+</html>

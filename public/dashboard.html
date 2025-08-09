@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard | Tutoring Platform</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Your Dashboard</h1>
+  </header>
+  <main>
+    <p>Hello, {{USERNAME}}! Choose a video lesson below:</p>
+    <ul>
+      <li><a href="/video/1">Introduction to Circuit Analysis</a></li>
+      <li><a href="/video/2">Signal Processing Basics</a></li>
+    </ul>
+  </main>
+  <footer>
+    <nav>
+      <a href="/logout">Logout</a>
+    </nav>
+  </footer>
+</body>
+</html>
