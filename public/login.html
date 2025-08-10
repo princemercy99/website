@@ -1,29 +1,44 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Login | Tutoring Platform</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header>
     <h1>Login</h1>
   </header>
+
   <main>
     <form method="POST" action="/login">
-      <label for="username">Username</label>
-      <input type="text" id="username" name="username" required>
+      <label for="email">Email</label>
+      <input 
+        id="email" 
+        name="email" 
+        type="email" 
+        placeholder="you@example.com" 
+        required 
+      />
+
       <label for="password">Password</label>
-      <input type="password" id="password" name="password" required>
-      <button type="submit">Login</button>
+      <input 
+        id="password" 
+        name="password" 
+        type="password" 
+        placeholder="Enter your password" 
+        required 
+      />
+
+      <button type="submit">Log in</button>
     </form>
-    <p>Don't have an account? <a href="/register">Register here</a>.</p>
+
+    <p>Don't have an account? <a href="/register">Register here</a></p>
   </main>
+
   <footer>
-    <nav>
-      <a href="/">Home</a>
-    </nav>
+    <p>&copy; 2025 Tutoring Platform</p>
   </footer>
 </body>
 </html>
